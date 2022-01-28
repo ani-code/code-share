@@ -1,0 +1,288 @@
+--drop table accbasea; 
+--TRANSFORMATION
+create multiset volatile table accbasea
+as
+(
+select accountid, vertical, messagetype, 
+invoice_month, 
+oreplace(((invoice_month(FORMAT 'MMM') (CHAR(3))) ||'-'|| EXTRACT (year FROM invoice_month)),' ','') as invoice_pd, 
+trial_start_date, 
+trial_end_date, 
+conversion_Date, 
+ADD_MONTHS(conversion_Date - EXTRACT(DAY FROM conversion_Date)+1, 0) as conv_start_date, 
+case when conversion_Date is null then 0 else 1 end as conversion_flag, 
+case when invoice_month is null then 0 else 1 end as retained_flag, 
+tier, 
+total_messages_sent,
+new_subs_Added,
+case when messagetype = 'SMS' then total_messages_sent end as total_SMS_sent, 
+case when messagetype = 'MMS' then total_messages_sent end as total_MMS_sent, 
+zeroifnull(total_cost) as total_cost,
+(total_cost/nullifzero(total_SMS_sent) ) as cost_per_SMS, 
+(total_cost/nullifzero(total_MMS_sent) ) as cost_per_MMS, 
+ROW_NUMBER() OVER (PARTITION BY accountid ORDER BY invoice_month) as unique_account, 
+ROW_NUMBER() OVER (PARTITION BY accountid ORDER BY invoice_month desc) as last_invoice, 
+ROW_NUMBER() OVER (PARTITION BY accountid,invoice_month ORDER BY invoice_month) as row_nr --assigns a unique number to each account+invoice month
+from ANI_att --replica of the dataset shared
+
+) with data  primary index (accountid, invoice_pd) on commit preserve rows; 
+
+--1 row per invoice month per account
+--drop table att_base; 
+create multiset volatile table att_base
+as
+(
+select accountid, vertical, invoice_month,invoice_pd, trial_start_date, trial_end_date, tier, 
+conversion_flag, conversion_Date, 
+ADD_MONTHS(a.conversion_Date - EXTRACT(DAY FROM a.conversion_Date)+1, 0) as conv_start_date, 
+retained_flag,new_subscribers_added,total_SMS_sent,total_MMS_sent,total_SMS_cost,total_MMS_cost, cost_per_SMS, cost_per_MMS,
+
+total_cost as total_spend,
+ROW_NUMBER() OVER (PARTITION BY accountid ORDER BY invoice_month) as row_nr , 
+ROW_NUMBER() OVER (PARTITION BY accountid ORDER BY invoice_month desc) as row_nr_desc
+from 
+
+(
+select accountid, vertical, invoice_month,invoice_pd, trial_start_date, trial_end_date, tier, 
+conversion_flag, retained_flag,conversion_Date,
+
+sum(case when row_nr = 1 then new_subs_added end) as new_subscribers_added, 
+sum(case when messagetype = 'SMS' then total_messages_sent end) as total_SMS_sent, 
+sum(case when messagetype = 'MMS' then total_messages_sent end) as total_MMS_sent, 
+sum(case when messagetype = 'SMS' then total_cost end) as total_SMS_cost, 
+sum(case when messagetype = 'MMS' then total_cost end) as total_MMS_cost, 
+sum(total_cost) as total_cost, 
+avg(cost_per_SMS) as cost_per_SMS, 
+avg(cost_per_MMS) as cost_per_MMS
+from accbasea as a
+--where accountid = '0011K000022FnEZQA0'
+group by 1,2,3,4,5,6,7,8,9,10) as a
+)
+with data unique primary index (accountid, invoice_pd) on commit preserve rows; 
+
+--drop table fromtable; 
+create multiset volatile table fromtable as att_base with data on commit preserve rows; 
+collect stats on fromtable column (accountid, invoice_pd); 
+
+--create a block to pull cumulative
+---drop table ANI_att_ac_base; 
+create multiset table ANI_att_ac_base as
+(
+select 
+a.accountid, a.vertical, a.invoice_month, a.invoice_pd,  a.tier, 
+a.new_subscribers_added, a.total_SMS_sent, a.total_MMS_sent, a.total_SMS_cost, a.total_MMS_cost, a.cost_per_SMS, a.cost_per_MMS, a.row_nr, a.row_nr_desc, 
+
+b.trial_start_date, b.trial_end_date, 
+case when b.conversion_flag >= 1 then 1 else 0 end as conversion_flag,
+b.conversion_Date, 
+a.conv_start_date, 
+b.first_invoice, b.last_invoice, b.total_invoices, b.converted_invoices, 
+
+total_spend,
+
+--create rolling numbers is needed in data agg
+(
+select Sum(b.new_subscribers_added) 
+from fromtable as b 
+where a.accountid = b.accountid
+and a.invoice_month >= b.invoice_month) as rolling_sum_new_subs, 
+(
+select Sum(b.total_SMS_sent) 
+from fromtable as b 
+where a.accountid = b.accountid
+and a.invoice_month >= b.invoice_month) as rolling_sum_SMS,
+(
+select Sum(b.total_SMS_cost) 
+from fromtable as b 
+where a.accountid = b.accountid
+and a.invoice_month >= b.invoice_month) as rolling_sum_SMS_cost,
+
+(
+select Sum(b.total_MMS_sent) 
+from fromtable as b 
+where a.accountid = b.accountid
+and a.invoice_month >= b.invoice_month) as rolling_sum_MMS,
+(
+select Sum(b.total_MMS_cost) 
+from fromtable as b 
+where a.accountid = b.accountid
+and a.invoice_month >= b.invoice_month) as rolling_sum_MMS_cost, 
+
+(
+select Sum(b.total_spend) 
+from fromtable as b 
+where a.accountid = b.accountid
+and a.invoice_month >= b.invoice_month) as rolling_sum_spend 
+
+
+from att_base as a
+
+left join 
+(
+--get 1 row per account
+select accountid, 
+min(trial_start_date) as trial_start_date, 
+max(trial_end_date) As trial_end_date, 
+sum(conversion_flag) as conversion_flag,
+min(conversion_date) as conversion_Date, 
+min(invoice_month) as first_invoice, 
+max(invoice_month) as last_invoice, 
+count(distinct case when conv_start_date is not null then (invoice_pd) end) as converted_invoices, 
+count(distinct(invoice_pd)) as total_invoices
+
+from accbasea 
+group by 1) as b on a.accountid = b.accountid and a.row_nr = 1--This ensures values are mapped only on the first row as 1 account has multiple rows. Helps dedup
+--where a.accountid = '0011K00002NZtXbQAL'
+)
+with data unique primary index (accountid, invoice_pd); 
+collect stats on  ANI_att_ac_base column (accountid, invoice_pd); 
+
+--drop table ANI_att_ac_final ; 
+--CREATE FINAL TABLE WITH CLEAN AND PROCESSED DATA READY TO BE MANIPULATED IN EXCEL
+create multiset table ANI_att_ac_final as
+(
+select 
+accountid                     ,
+vertical                      ,
+invoice_month                 ,
+invoice_pd                    ,
+Tier                          ,
+new_subscribers_added         ,
+total_SMS_sent                ,
+total_MMS_sent                ,
+total_SMS_cost                ,
+total_MMS_cost                ,
+cost_per_SMS                  ,
+cost_per_MMS                  ,
+trial_start_date              ,
+trial_end_date                ,
+conversion_flag               ,
+conversion_Date               ,
+conv_start_date,
+case when row_nr = 1 then first_invoice else null end as first_invoice, 
+case when row_nr = 1 then last_invoice else null end as last_invoice,      
+total_invoices                ,
+converted_invoices, 
+rolling_sum_new_subs          ,
+rolling_sum_SMS               ,
+rolling_sum_SMS_cost          ,
+rolling_sum_MMS               ,
+rolling_sum_MMS_cost          ,
+row_nr, 
+row_nr_desc,
+total_spend
+
+from ANI_att_ac_base as a 
+)
+with data unique primary index (accountid, invoice_pd); 
+collect stats on  ANI_att_ac_final column (accountid, invoice_pd,row_nr); 
+--QUICK EXCEL FETCH
+--create a table to store all exclusions
+create multiset  table ANI_att_excl
+as
+(
+select distinct accountid, 
+trial_start_date,
+trial_end_date,
+conversion_Date,
+case when trial_end_date < trial_start_date and trial_end_date is not null then 1 else 0 end as trial_exclusion_flag, 
+case when conversion_Date < trial_start_date and trial_start_date is not null then 1 else 0 end as conv_exclusion_flag
+
+from ANI_att_ac_final 
+where trial_exclusion_flag = 1 OR conv_exclusion_flag = 1
+) with data unique primary index (accountid);
+
+
+--for subscriber growth rate
+select invoice_month, tier, 
+count(distinct(accountid)) as accounts, 
+sum(new_subscribers_added) as new_subscribers_added, 
+sum(total_SMS_sent)As total_SMS_sent, 
+sum(total_MMS_sent) as total_MMS_sent,
+sum(total_SMS_cost) as total_SMS_cost,
+sum(total_MMS_cost) as total_MMS_cost, 
+sum(total_spend) as total_spend
+from ANI_att_ac_final as a
+where vertical = 'Retail/e-Commerce'--largest vertical
+and accountid not in (select accountid from ANI_att_excl)
+--and accountid in ('0011K00002NZtXbQAL','0011K000022FnEZQA0')
+group by 1,2
+
+
+--spend curve by row nr
+select tier,
+vertical, 
+row_nr, 
+case when b.total_invoices >= 6 then 1 else 0 end as atleast_6_invoices_flag, 
+count(distinct(a.accountid)) as accounts, 
+sum(total_SMS_cost) as total_SMS_cost, 
+sum(total_MMS_cost) as total_MMS_cost ,
+sum(total_SMS_sent)As total_SMS_sent, 
+sum(total_MMS_sent) as total_MMS_sent
+
+from ANI_att_ac_final as a 
+left join (
+select accountid, sum(total_invoices) as total_invoices from ANI_att_ac_base where conv_start_date is not null 
+group by 1 ) as b on a.accountid = b.accountid --get # of invoices (billed periods)
+
+where conv_start_date is not null--converted clients
+and a.accountid not in (select accountid from ANI_att_excl)
+--and a.accountid in ('0011K00002NZtXbQAL','0011K000022FnEZQA0')
+group by 1,2,3,4;
+
+
+--client growth rate
+select invoice_month, 
+count(distinct(accountid)) as accounts
+from ANI_att_ac_final as a
+where conv_start_date is not null--converted clients
+and a.accountid not in (select accountid from ANI_att_excl)
+group by 1 
+
+--create cumulative subcribers, revenue
+
+
+select accountid, 
+case when total_spend = 0 then '0'
+when total_spend between 1 and 1000 then '0-1000'
+when total_spend between 1001 and 10000 then '1001-10000'
+when total_spend between 10001 and 20000 then '10001-20000'
+when total_spend between 20001 and 30000 then '20001-30000'
+when total_spend between 30001 and 40000 then '30001-40000'
+when total_spend between 40001 and 50000 then '40001-50000'
+when total_spend between 50001 and 60000 then '50001-60000'
+when total_spend between 60001 and 70000 then '60001-70000'
+when total_spend between 70001 and 80000 then '70001-80000'
+when total_spend between 80001 and 90000 then '80001-90000'
+when total_spend between 90001 and 100000 then '90001-100000'
+when total_spend > 100000 then '100k+' end as spend_distro, 
+case when converted_invoices = 0 then 
+count(distinct(accountid)) as accounts
+from 
+
+(
+select accountid, 
+sum(total_SMS_cost) as totalSMScost, 
+sum(total_MMS_cost) as totalMMScost ,
+sum(total_invoices) as total_invoices,
+sum(converted_invoices) as converted_invoices,
+sum(total_spend) as total_spend
+from ANI_att_ac_final as a
+--where conv_start_date is not null--converted clients
+where a.accountid not in (select accountid from ANI_att_excl)
+--and a.accountid in ('0011K000022FnEZQA0')
+group by 1 ) as a group by 1 ,2
+
+--retain
+select accountid, 
+((last_invoice - first_invoice) MONTH) as retained_month
+from 
+(
+select accountid, min(first_invoice) as first_invoice,
+max(last_invoice) as last_invoice,
+count(distinct(accountid)) as accounts
+from ANI_att_ac_final as a
+where a.accountid not in (select accountid from ANI_att_excl)
+ --and accountid = '0011K00002MXoHQQA1'
+group by 1 ) As x
+
